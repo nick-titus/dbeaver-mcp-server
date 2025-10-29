@@ -4,13 +4,14 @@ import path from 'path';
 import os from 'os';
 import csv from 'csv-parser';
 import { Client } from 'pg';
-import { 
-  DBeaverConnection, 
-  QueryResult, 
-  SchemaInfo, 
-  ExportOptions, 
+import sql from 'mssql';
+import {
+  DBeaverConnection,
+  QueryResult,
+  SchemaInfo,
+  ExportOptions,
   ConnectionTest,
-  DatabaseStats 
+  DatabaseStats
 } from './types.js';
 import { findDBeaverExecutable, getTestQuery, parseVersionFromResult, buildSchemaQuery, buildListTablesQuery } from './utils.js';
 
@@ -112,14 +113,16 @@ export class DBeaverClient {
 
   private async executeWithNativeTool(connection: DBeaverConnection, query: string): Promise<QueryResult> {
     const driver = connection.driver.toLowerCase();
-    
+
     if (driver.includes('sqlite')) {
       return this.executeSQLiteQuery(connection, query);
     } else if (driver.includes('postgres')) {
       return this.executePostgreSQLQuery(connection, query);
+    } else if (driver.includes('mssql') || driver.includes('sqlserver') || driver.includes('microsoft')) {
+      return this.executeMSSQLQuery(connection, query);
     } else {
       // For unsupported drivers, return a helpful error instead of crashing
-      throw new Error(`Database driver "${driver}" is not yet supported for direct query execution. Supported drivers: SQLite, PostgreSQL. Please use DBeaver GUI for this connection type.`);
+      throw new Error(`Database driver "${driver}" is not yet supported for direct query execution. Supported drivers: SQLite, PostgreSQL, SQL Server. Please use DBeaver GUI for this connection type.`);
     }
   }
 
@@ -220,6 +223,89 @@ export class DBeaverClient {
       return { columns, rows, rowCount: typeof res.rowCount === 'number' ? res.rowCount : rows.length, executionTime: 0 };
     } finally {
       try { await client.end(); } catch {}
+    }
+  }
+
+  private async executeMSSQLQuery(connection: DBeaverConnection, query: string): Promise<QueryResult> {
+    // Extract connection properties
+    const host = connection.host || connection.properties?.host || 'localhost';
+    const port = connection.port || (connection.properties?.port ? parseInt(connection.properties.port) : 1433);
+    const database = connection.database || connection.properties?.database;
+    const user = connection.user || connection.properties?.user;
+    const password = connection.properties?.password;
+
+    // Validate required properties
+    if (!database) {
+      throw new Error('SQL Server database name is required');
+    }
+    if (!user) {
+      throw new Error('SQL Server username is required');
+    }
+    if (!password) {
+      throw new Error('SQL Server password is required. Ensure credentials are saved in DBeaver.');
+    }
+
+    // Configure connection for AWS RDS
+    const config: sql.config = {
+      server: host,
+      port: port,
+      database: database,
+      user: user,
+      password: password,
+      options: {
+        encrypt: true,  // AWS RDS requires encryption
+        trustServerCertificate: true,  // Trust AWS-managed certificates
+        enableArithAbort: true,  // Required by mssql package
+        connectTimeout: this.timeout,
+        requestTimeout: this.timeout
+      }
+    };
+
+    const pool = new sql.ConnectionPool(config);
+
+    try {
+      await pool.connect();
+
+      if (this.debug) {
+        console.log(`SQL Server connected: ${host}:${port}/${database}`);
+      }
+
+      const result = await pool.request().query(query);
+
+      // Extract columns from metadata
+      const columns: string[] = Object.keys(result.recordset.columns);
+
+      // Convert rows to array format
+      const rows: any[][] = result.recordset.map((row: any) =>
+        columns.map(col => row[col])
+      );
+
+      return {
+        columns,
+        rows,
+        rowCount: result.rowsAffected[0] || rows.length,
+        executionTime: 0
+      };
+    } catch (error) {
+      // Provide clear error messages
+      if (error instanceof Error) {
+        if (error.message.includes('timeout')) {
+          throw new Error(`SQL Server connection timed out connecting to ${host}:${port}. Check network access and firewall rules.`);
+        } else if (error.message.includes('Login failed')) {
+          throw new Error(`SQL Server authentication failed for user '${user}'. Verify credentials in DBeaver.`);
+        } else if (error.message.includes('SSL') || error.message.includes('certificate')) {
+          throw new Error(`SQL Server SSL connection failed. AWS RDS requires encrypt=true. Original error: ${error.message}`);
+        }
+      }
+      throw new Error(`SQL Server query failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      try {
+        await pool.close();
+      } catch (closeError) {
+        if (this.debug) {
+          console.warn('Failed to close SQL Server connection pool:', closeError);
+        }
+      }
     }
   }
 
