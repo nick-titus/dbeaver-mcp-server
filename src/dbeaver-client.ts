@@ -264,7 +264,13 @@ export class DBeaverClient {
     const pool = new sql.ConnectionPool(config);
 
     try {
-      await pool.connect();
+      // Wrap connection with explicit timeout protection
+      await Promise.race([
+        pool.connect(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`SQL Server connection attempt timed out after ${this.timeout}ms`)), this.timeout)
+        )
+      ]);
 
       if (this.debug) {
         console.log(`SQL Server connected: ${host}:${port}/${database}`);
@@ -302,9 +308,12 @@ export class DBeaverClient {
       try {
         await pool.close();
       } catch (closeError) {
-        if (this.debug) {
-          console.warn('Failed to close SQL Server connection pool:', closeError);
-        }
+        // ALWAYS log connection pool cleanup failures - they indicate resource leaks
+        console.error('Failed to close SQL Server connection pool:', {
+          error: closeError instanceof Error ? closeError.message : String(closeError),
+          host,
+          database
+        });
       }
     }
   }
