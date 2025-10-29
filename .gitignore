@@ -48,4 +48,7 @@ coverage/
 # Test results
 test-results/
 
+# Git worktrees
+.worktrees/
+
 database-mcp/
